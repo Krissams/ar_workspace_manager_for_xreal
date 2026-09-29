@@ -225,7 +225,11 @@ public final class VirtualDisplayService {
     /// lowest free slot, so its serial — and therefore the CGDisplay UUID macOS derives from
     /// vendor/product/serial — comes from a small bounded pool (slot 0, 1, 2, …) instead of being
     /// unique per screen.
-    private static let serialBase: UInt32 = 0x56520000
+    // Version the bounded identity pool once to avoid replaying legacy display sets that
+    // marked the physical output IndependentOutput. macOS can hide that output whenever
+    // the old virtual identity returns, even after successful mode/enable transactions.
+    // Keep this pool stable across launches; never use random serials per session.
+    private static let serialBase: UInt32 = 0x56520100
     /// Slot index reserved for each active screen id, freed on destroy so the pool stays compact.
     private var slotForID: [UUID: UInt32] = [:]
     /// The backing pixel mode each active display was built with, so `reconcile` can reuse a live

@@ -55,4 +55,7 @@ void VRDSetCursorScale(float scale);
 // success; on an exception returns NO and sets *reason to the exception's reason/name.
 BOOL VRDRunCatchingNSException(void (^block)(void), NSString * _Nullable * _Nullable reason);
 
+// Includes connected displays disabled by a saved WindowServer configuration.
+CGError VRDGetAllDisplays(uint32_t capacity, CGDirectDisplayID *displays, uint32_t *count);
+
 NS_ASSUME_NONNULL_END

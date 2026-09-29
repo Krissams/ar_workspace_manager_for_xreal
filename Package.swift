@@ -50,6 +50,7 @@ let package = Package(
             linkerSettings: [.linkedFramework("CoreGraphics")]
         ),
         .target(name: "DisplayManager", dependencies: ["CPrivateDisplay"]),
+        .testTarget(name: "DisplayManagerTests", dependencies: ["DisplayManager"]),
         .target(name: "Compositor", dependencies: ["GlassesDriver", "CapturePipeline"]),
         // Re-declares NSXPCConnection.auditToken (header-only) so the helper can identify clients.
         .target(name: "CXPCAuditToken"),

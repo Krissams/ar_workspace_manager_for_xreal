@@ -2077,6 +2077,9 @@ final class AppCoordinator: ObservableObject {
         return nil
     }
 
+    // A token invalidates delayed startup callbacks when Stop or a new session intervenes.
+    private var outputStartupToken: UUID?
+
     // MARK: AR session
 
     /// UI-friendly AR toggle: stop if running, else start on the glasses (or the first non-main
@@ -2151,6 +2154,9 @@ final class AppCoordinator: ObservableObject {
         }
 
         let outputDisplayID = Self.screenDisplayID(screen)
+        let outputRecovery = OutputDisplayRecovery(displayID: outputDisplayID)
+        let startupToken = UUID()
+        outputStartupToken = startupToken
         glassesDisplayID = outputDisplayID
         lastOutputScreenID = outputDisplayID
         // Snapshot the user's current OS display arrangement so we can restore it on Stop —
@@ -2159,7 +2165,7 @@ final class AppCoordinator: ObservableObject {
         // Make sure every connected monitor is in the layout (the main display anchors the OS
         // arrangement). (Re-reads the workspace below in case this adds entries.)
         syncPhysicalMonitors()
-        guard let workspace = workspaceStore.activeWorkspace else { return }
+        guard let workspace = workspaceStore.activeWorkspace else { outputStartupToken = nil; return }
         let dsNow = SystemHealth.processCPU(matching: ["colorsync.displayservices"]).first?.cpu ?? 0
         DebugLog.shared.log("beginAR on '\(screen.localizedName)' id=\(outputDisplayID) frame=\(NSStringFromRect(screen.frame)) colorsync=\(Int(dsNow))%")
 
@@ -2211,27 +2217,57 @@ final class AppCoordinator: ObservableObject {
         }
         statusMessage = "Waiting for displays to settle…"
 
-        // Adding the virtual displays just re-arranged the global screen layout
-        // (they get inserted into the arrangement, shifting the glasses' origin).
-        // Re-resolve the output screen by ID once things settle, then open the window.
-        let screenCount = pairs.count
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            guard let self, self.arActive else { return }
-            // Lay the OS displays out to match the GUI before opening the output window.
-            self.arrangeDisplaysToMatchGUI(force: true)
-            let target = NSScreen.screens.first { Self.screenDisplayID($0) == outputDisplayID } ?? screen
-            renderer.startOutput(on: target)
-            self.outputScreenName = target.localizedName
-            self.applyConfiguredMirrors() // restore any virtual→physical mirrors
-            self.applyAllScreenBackgrounds() // set each virtual display's desktop wallpaper
-            self.updateCursorConfinement()
-            self.statusMessage = "AR active on \(target.localizedName) \(Int(target.frame.width))×\(Int(target.frame.height)) at (\(Int(target.frame.origin.x)),\(Int(target.frame.origin.y))) with \(screenCount) screen(s)"
-            // Let the OS arrangement settle, then offer to put windows back on their screens.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-                guard let self, self.arActive else { return }
-                self.maybeRestoreWindowLayout()
+        // Virtual-display creation can restore a saved macOS display set with a different
+        // output mode. Recover the user's pre-start mode before opening a render window.
+        var recovery = OutputStartupRecovery(now: CACurrentMediaTime())
+        func finishStartup() {
+            guard self.arActive, self.outputStartupToken == startupToken else { return }
+            let id = outputRecovery?.resolve()
+                ?? (outputRecovery == nil && CGDisplayIsOnline(outputDisplayID) != 0 ? outputDisplayID : nil)
+            if let id { self.glassesDisplayID = id }
+            let target = id.flatMap { id in NSScreen.screens.first { Self.screenDisplayID($0) == id } }
+            let modeMatches = id.map { outputRecovery?.matches($0) ?? true } ?? false
+            let ready = id.map { CGDisplayIsActive($0) != 0 && CGDisplayMirrorsDisplay($0) == 0 } == true
+                && target != nil && modeMatches
+            let action = recovery.advance(now: CACurrentMediaTime(), ready: ready,
+                                          canRestore: id != nil && outputRecovery != nil)
+            if ready, let target {
+                if action == .arrange {
+                    self.arrangeDisplaysToMatchGUI(force: true)
+                    self.applyConfiguredMirrors()
+                    // Re-resolve after arrangement; never render onto the old NSScreen object.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { finishStartup() }
+                    return
+                }
+                self.outputStartupToken = nil
+                self.lastOutputScreenID = Self.screenDisplayID(target)
+                renderer.startOutput(on: target)
+                self.outputScreenName = target.localizedName
+                self.applyAllScreenBackgrounds()
+                self.updateCursorConfinement()
+                self.statusMessage = "AR active on \(target.localizedName) with \(pairs.count) screen(s)"
+                DebugLog.shared.log("AR output ready id=\(self.glassesDisplayID) after startup recovery")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                    guard let self, self.arActive, self.outputStartupToken == nil else { return }
+                    self.maybeRestoreWindowLayout()
+                }
+                return
             }
+            guard action != .fail else {
+                DebugLog.shared.log("AR startup: output did not recover after \(recovery.attempts) mode restores")
+                self.stopAR(snapshotLayout: false)
+                self.statusMessage = "Output display did not recover during startup — check Displays settings and retry"
+                return
+            }
+            if action == .restore, let id, let outputRecovery {
+                let wasOnline = CGDisplayIsOnline(id) != 0
+                let result = outputRecovery.restore(id)
+                DebugLog.shared.log("AR startup: recovery output \(id) online=\(wasOnline) target=\(outputRecovery.mode.width)×\(outputRecovery.mode.height)@\(outputRecovery.mode.refreshRate) result=\(result.rawValue)")
+            }
+            self.statusMessage = "Waiting for glasses display to recover…"
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { finishStartup() }
         }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { finishStartup() }
     }
 
     /// Apply each virtual screen's configured desktop background to its macOS display. Called once
@@ -3487,11 +3523,11 @@ final class AppCoordinator: ObservableObject {
     /// Debounced + mode-switch-aware: a momentary drop during SBS renegotiation or a glitch
     /// shouldn't kill the session, only a display that's still gone a moment later.
     private func handleScreenChange() {
-        guard arActive, glassesDisplayID != 0, !switchingDisplayMode else { return }
+        guard arActive, outputStartupToken == nil, glassesDisplayID != 0, !switchingDisplayMode else { return }
         guard !NSScreen.screens.contains(where: { Self.screenDisplayID($0) == glassesDisplayID }) else { return }
         let missingID = glassesDisplayID
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            guard let self, self.arActive, self.glassesDisplayID == missingID, !self.switchingDisplayMode else { return }
+            guard let self, self.arActive, self.outputStartupToken == nil, self.glassesDisplayID == missingID, !self.switchingDisplayMode else { return }
             if !NSScreen.screens.contains(where: { Self.screenDisplayID($0) == missingID }) {
                 DebugLog.shared.log("Output display \(missingID) gone — stopping AR")
                 self.stopAR()
@@ -4222,6 +4258,7 @@ final class AppCoordinator: ObservableObject {
     /// restored next time — pass false when the windows have ALREADY been scattered (e.g. the
     /// displays dropped out during sleep), so we don't overwrite the good pre-sleep snapshot.
     func stopAR(snapshotLayout: Bool = true) {
+        outputStartupToken = nil
         guard arActive else { return }
         DebugLog.shared.log("stopAR(snapshotLayout: \(snapshotLayout))")
         mediaPlayer?.setAR(active: false)              // pause the video when AR stops

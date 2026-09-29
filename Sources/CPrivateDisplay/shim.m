@@ -36,3 +36,11 @@ BOOL VRDRunCatchingNSException(void (^block)(void), NSString **reason) {
         return NO;
     }
 }
+
+// Resolve private entry points at runtime: fail explicitly on unsupported macOS versions.
+CGError VRDGetAllDisplays(uint32_t capacity, CGDirectDisplayID *displays, uint32_t *count) {
+    typedef CGError (*Fn)(uint32_t, CGDirectDisplayID *, uint32_t *);
+    Fn getDisplays = (Fn)dlsym(RTLD_DEFAULT, "CGSGetDisplayList");
+    return getDisplays ? getDisplays(capacity, displays, count)
+                       : CGGetOnlineDisplayList(capacity, displays, count);
+}
